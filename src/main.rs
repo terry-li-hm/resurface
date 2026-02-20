@@ -521,40 +521,285 @@ fn search_prompts(
 
 // --- Search transcripts (deep) ---
 
-fn search_transcripts(pattern: &str, start_ms: i64, end_ms: i64) -> Vec<SearchMatch> {
+fn search_transcripts(
+    pattern: &str,
+    start_ms: i64,
+    end_ms: i64,
+    tool_filter: Option<&str>,
+) -> Vec<SearchMatch> {
     let regex = Regex::new(&format!("(?i){}", pattern)).unwrap_or_else(|_| {
         eprintln!("Invalid regex pattern: {}", pattern);
         std::process::exit(1);
     });
 
-    let proj_dir = projects_dir();
-    if !proj_dir.exists() {
-        return Vec::new();
+    let mut matches = Vec::new();
+
+    // Claude transcripts
+    if tool_filter.is_none()
+        || tool_filter
+            .map(|t| t.eq_ignore_ascii_case("claude"))
+            .unwrap_or(false)
+    {
+        let proj_dir = projects_dir();
+        if proj_dir.exists() {
+            // Collect session files with mtime in range (with 1-day buffer)
+            let start_epoch = (start_ms / 1000) - 86400;
+            let end_epoch = (end_ms / 1000) + 86400;
+
+            let mut session_files: Vec<PathBuf> = Vec::new();
+            if let Ok(projects) = fs::read_dir(&proj_dir) {
+                for proj in projects.filter_map(|e| e.ok()) {
+                    if !proj.path().is_dir() {
+                        continue;
+                    }
+                    if let Ok(files) = fs::read_dir(proj.path()) {
+                        for f in files.filter_map(|e| e.ok()) {
+                            let path = f.path();
+                            if path.extension().map(|x| x == "jsonl").unwrap_or(false) {
+                                if let Ok(meta) = path.metadata() {
+                                    if let Ok(mtime) = meta.modified() {
+                                        let epoch = mtime
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs() as i64;
+                                        if epoch >= start_epoch && epoch <= end_epoch {
+                                            session_files.push(path);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Parallel scan with rayon
+            let claude_matches: Vec<SearchMatch> = session_files
+                .par_iter()
+                .flat_map(|path| {
+                    let mut file_matches = Vec::new();
+                    let file = match fs::File::open(path) {
+                        Ok(f) => f,
+                        Err(_) => return file_matches,
+                    };
+                    let reader = BufReader::new(file);
+                    for line in reader.lines() {
+                        let line = match line {
+                            Ok(l) => l,
+                            Err(_) => continue,
+                        };
+                        let entry: TranscriptEntry = match serde_json::from_str(&line) {
+                            Ok(e) => e,
+                            Err(_) => continue,
+                        };
+                        let entry_type = match entry.entry_type.as_deref() {
+                            Some("user") | Some("assistant") => {
+                                entry.entry_type.as_deref().unwrap()
+                            }
+                            _ => continue,
+                        };
+
+                        let ts_str = match &entry.timestamp {
+                            Some(s) => s.clone(),
+                            None => continue,
+                        };
+                        let ts_dt =
+                            match DateTime::parse_from_rfc3339(&ts_str.replace('Z', "+00:00")) {
+                                Ok(dt) => dt,
+                                Err(_) => match ts_str.parse::<DateTime<Utc>>() {
+                                    Ok(dt) => dt.fixed_offset(),
+                                    Err(_) => continue,
+                                },
+                            };
+                        let ts_ms = ts_dt.timestamp() * 1000;
+                        if ts_ms < start_ms || ts_ms >= end_ms {
+                            continue;
+                        }
+
+                        let content = match &entry.message {
+                            Some(msg) => match &msg.content {
+                                Some(c) => c,
+                                None => continue,
+                            },
+                            None => continue,
+                        };
+
+                        let text = extract_text(content);
+                        if text.is_empty() {
+                            continue;
+                        }
+
+                        if let Some(m) = regex.find(&text) {
+                            let hkt_dt = ts_dt.with_timezone(&hkt());
+                            let session = entry.session_id.unwrap_or_else(|| {
+                                path.file_stem()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string()
+                            });
+                            let role = if entry_type == "user" {
+                                "you"
+                            } else {
+                                "claude"
+                            };
+                            let snippet = make_snippet(&text, m.start(), m.end());
+
+                            file_matches.push(SearchMatch {
+                                date: hkt_dt.format("%Y-%m-%d").to_string(),
+                                time_str: hkt_dt.format("%H:%M").to_string(),
+                                timestamp_ms: ts_ms,
+                                session: session[..session.len().min(8)].to_string(),
+                                role: role.into(),
+                                snippet,
+                                tool: "Claude".into(),
+                            });
+                        }
+                    }
+                    file_matches
+                })
+                .collect();
+
+            matches.extend(claude_matches);
+        }
     }
 
-    // Collect session files with mtime in range (with 1-day buffer)
-    let start_epoch = (start_ms / 1000) - 86400;
-    let end_epoch = (end_ms / 1000) + 86400;
+    // OpenCode transcripts
+    if tool_filter.is_none()
+        || tool_filter
+            .map(|t| t.eq_ignore_ascii_case("opencode"))
+            .unwrap_or(false)
+    {
+        let storage = opencode_storage();
+        let session_dir = storage.join("session");
+        if session_dir.exists() {
+            let session_dirs: Vec<_> = match fs::read_dir(&session_dir) {
+                Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+                Err(_) => Vec::new(),
+            };
 
-    let mut session_files: Vec<PathBuf> = Vec::new();
-    if let Ok(projects) = fs::read_dir(&proj_dir) {
-        for proj in projects.filter_map(|e| e.ok()) {
-            if !proj.path().is_dir() {
-                continue;
-            }
-            if let Ok(files) = fs::read_dir(proj.path()) {
-                for f in files.filter_map(|e| e.ok()) {
-                    let path = f.path();
-                    if path.extension().map(|x| x == "jsonl").unwrap_or(false) {
-                        if let Ok(meta) = path.metadata() {
-                            if let Ok(mtime) = meta.modified() {
-                                let epoch = mtime
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs() as i64;
-                                if epoch >= start_epoch && epoch <= end_epoch {
-                                    session_files.push(path);
+            for sess_entry in session_dirs {
+                let sess_path = sess_entry.path();
+                if !sess_path.is_dir() {
+                    continue;
+                }
+                let json_files: Vec<_> = match fs::read_dir(&sess_path) {
+                    Ok(rd) => rd
+                        .filter_map(|e| e.ok())
+                        .filter(|e| {
+                            e.path()
+                                .extension()
+                                .map(|x| x == "json")
+                                .unwrap_or(false)
+                        })
+                        .collect(),
+                    Err(_) => continue,
+                };
+
+                for jf in json_files {
+                    let content = match fs::read_to_string(jf.path()) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let sess: OpenCodeSession = match serde_json::from_str(&content) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+
+                    let created = sess.time.as_ref().and_then(|t| t.created).unwrap_or(0);
+                    let updated = sess.time.as_ref().and_then(|t| t.updated).unwrap_or(0);
+                    if !((start_ms <= created && created < end_ms)
+                        || (start_ms <= updated && updated < end_ms))
+                    {
+                        continue;
+                    }
+
+                    let sess_id = match sess.id {
+                        Some(id) => id,
+                        None => continue,
+                    };
+
+                    let msg_dir = storage.join("message").join(&sess_id);
+                    if !msg_dir.exists() {
+                        continue;
+                    }
+
+                    let msg_files: Vec<_> = match fs::read_dir(&msg_dir) {
+                        Ok(rd) => rd
+                            .filter_map(|e| e.ok())
+                            .filter(|e| {
+                                e.file_name()
+                                    .to_str()
+                                    .map(|n| n.starts_with("msg_") && n.ends_with(".json"))
+                                    .unwrap_or(false)
+                            })
+                            .collect(),
+                        Err(_) => continue,
+                    };
+
+                    for mf in msg_files {
+                        let mc = match fs::read_to_string(mf.path()) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        let msg: OpenCodeMessage = match serde_json::from_str(&mc) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+
+                        let role_str = msg.role.as_deref().unwrap_or("");
+                        if role_str != "user" && role_str != "assistant" {
+                            continue;
+                        }
+
+                        let ts_ms = msg.time.as_ref().and_then(|t| t.created).unwrap_or(0);
+                        if ts_ms < start_ms || ts_ms >= end_ms {
+                            continue;
+                        }
+
+                        let msg_id = match msg.id {
+                            Some(id) => id,
+                            None => continue,
+                        };
+
+                        let part_dir = storage.join("part").join(&msg_id);
+                        let mut text = String::new();
+                        if part_dir.exists() {
+                            if let Ok(rd) = fs::read_dir(&part_dir) {
+                                let mut parts: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+                                parts.sort_by_key(|e| e.file_name());
+                                for pf in parts {
+                                    if let Ok(pc) = fs::read_to_string(pf.path()) {
+                                        if let Ok(part) =
+                                            serde_json::from_str::<OpenCodePart>(&pc)
+                                        {
+                                            if let Some(t) = part.text {
+                                                text.push_str(&t);
+                                            }
+                                        }
+                                    }
                                 }
+                            }
+                        }
+
+                        if !text.is_empty() {
+                            if let Some(m) = regex.find(&text) {
+                                let dt = ms_to_hkt(ts_ms);
+                                let role = if role_str == "user" {
+                                    "you"
+                                } else {
+                                    "opencode"
+                                };
+                                let snippet = make_snippet(&text, m.start(), m.end());
+
+                                matches.push(SearchMatch {
+                                    date: dt.format("%Y-%m-%d").to_string(),
+                                    time_str: dt.format("%H:%M").to_string(),
+                                    timestamp_ms: ts_ms,
+                                    session: sess_id[..sess_id.len().min(8)].to_string(),
+                                    role: role.into(),
+                                    snippet,
+                                    tool: "OpenCode".into(),
+                                });
                             }
                         }
                     }
@@ -563,91 +808,6 @@ fn search_transcripts(pattern: &str, start_ms: i64, end_ms: i64) -> Vec<SearchMa
         }
     }
 
-    // Parallel scan with rayon
-    let all_matches: Vec<SearchMatch> = session_files
-        .par_iter()
-        .flat_map(|path| {
-            let mut file_matches = Vec::new();
-            let file = match fs::File::open(path) {
-                Ok(f) => f,
-                Err(_) => return file_matches,
-            };
-            let reader = BufReader::new(file);
-            for line in reader.lines() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => continue,
-                };
-                let entry: TranscriptEntry = match serde_json::from_str(&line) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                let entry_type = match entry.entry_type.as_deref() {
-                    Some("user") | Some("assistant") => entry.entry_type.as_deref().unwrap(),
-                    _ => continue,
-                };
-
-                let ts_str = match &entry.timestamp {
-                    Some(s) => s.clone(),
-                    None => continue,
-                };
-                let ts_dt =
-                    match DateTime::parse_from_rfc3339(&ts_str.replace('Z', "+00:00")) {
-                        Ok(dt) => dt,
-                        Err(_) => match ts_str.parse::<DateTime<Utc>>() {
-                            Ok(dt) => dt.fixed_offset(),
-                            Err(_) => continue,
-                        },
-                    };
-                let ts_ms = ts_dt.timestamp() * 1000;
-                if ts_ms < start_ms || ts_ms >= end_ms {
-                    continue;
-                }
-
-                let content = match &entry.message {
-                    Some(msg) => match &msg.content {
-                        Some(c) => c,
-                        None => continue,
-                    },
-                    None => continue,
-                };
-
-                let text = extract_text(content);
-                if text.is_empty() {
-                    continue;
-                }
-
-                if let Some(m) = regex.find(&text) {
-                    let hkt_dt = ts_dt.with_timezone(&hkt());
-                    let session = entry.session_id.unwrap_or_else(|| {
-                        path.file_stem()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string()
-                    });
-                    let role = if entry_type == "user" {
-                        "you"
-                    } else {
-                        "claude"
-                    };
-                    let snippet = make_snippet(&text, m.start(), m.end());
-
-                    file_matches.push(SearchMatch {
-                        date: hkt_dt.format("%Y-%m-%d").to_string(),
-                        time_str: hkt_dt.format("%H:%M").to_string(),
-                        timestamp_ms: ts_ms,
-                        session: session[..session.len().min(8)].to_string(),
-                        role: role.into(),
-                        snippet,
-                        tool: "Claude".into(),
-                    });
-                }
-            }
-            file_matches
-        })
-        .collect();
-
-    let mut matches = all_matches;
     matches.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
     matches
 }
@@ -881,7 +1041,7 @@ fn main() {
             let t0 = Instant::now();
 
             let matches = if deep {
-                search_transcripts(&pattern, start_ms, end_ms)
+                search_transcripts(&pattern, start_ms, end_ms, tool.as_deref())
             } else {
                 search_prompts(&pattern, start_ms, end_ms, tool.as_deref())
             };
