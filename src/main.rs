@@ -516,7 +516,6 @@ fn search_prompts(
     }
 
     matches.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
-    matches.truncate(50);
     matches
 }
 
@@ -650,7 +649,6 @@ fn search_transcripts(pattern: &str, start_ms: i64, end_ms: i64) -> Vec<SearchMa
 
     let mut matches = all_matches;
     matches.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
-    matches.truncate(50);
     matches
 }
 
