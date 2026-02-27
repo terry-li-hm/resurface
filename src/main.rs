@@ -138,6 +138,14 @@ enum Commands {
         #[arg(long)]
         tool: Option<String>,
 
+        /// Filter by role (you, claude, opencode, assistant)
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Filter by session ID (prefix match)
+        #[arg(long)]
+        session: Option<String>,
+
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -436,7 +444,16 @@ fn search_prompts(
     start_ms: i64,
     end_ms: i64,
     tool_filter: Option<&str>,
+    role_filter: Option<&str>,
+    session_filter: Option<&str>,
 ) -> Vec<SearchMatch> {
+    // Prompts are always role "you" — if filtering for assistant roles, skip entirely
+    if let Some(rf) = role_filter {
+        if !matches_role("you", rf) {
+            return Vec::new();
+        }
+    }
+
     let regex = Regex::new(&format!("(?i){}", pattern)).unwrap_or_else(|_| {
         eprintln!("Invalid regex pattern: {}", pattern);
         std::process::exit(1);
@@ -472,10 +489,15 @@ fn search_prompts(
                 if ts < start_ms || ts >= end_ms {
                     continue;
                 }
+                let session = entry.session_id.unwrap_or_else(|| "unknown".into());
+                if let Some(sf) = session_filter {
+                    if !session.starts_with(sf) && !session[..session.len().min(8)].starts_with(sf) {
+                        continue;
+                    }
+                }
                 let prompt_text = entry.display.or(entry.prompt).unwrap_or_default();
                 if let Some(m) = regex.find(&prompt_text) {
                     let dt = ms_to_hkt(ts);
-                    let session = entry.session_id.unwrap_or_else(|| "unknown".into());
                     let snippet = make_snippet(&prompt_text, m.start(), m.end());
 
                     matches.push(SearchMatch {
@@ -500,6 +522,11 @@ fn search_prompts(
     {
         let oc_prompts = scan_opencode(start_ms, end_ms);
         for p in &oc_prompts {
+            if let Some(sf) = session_filter {
+                if !p.session_full.starts_with(sf) && !p.session.starts_with(sf) {
+                    continue;
+                }
+            }
             if let Some(m) = regex.find(&p.prompt) {
                 let snippet = make_snippet(&p.prompt, m.start(), m.end());
                 matches.push(SearchMatch {
@@ -526,6 +553,8 @@ fn search_transcripts(
     start_ms: i64,
     end_ms: i64,
     tool_filter: Option<&str>,
+    role_filter: Option<&str>,
+    session_filter: Option<&str>,
 ) -> Vec<SearchMatch> {
     let regex = Regex::new(&format!("(?i){}", pattern)).unwrap_or_else(|_| {
         eprintln!("Invalid regex pattern: {}", pattern);
@@ -574,9 +603,12 @@ fn search_transcripts(
             }
 
             // Parallel scan with rayon
+            let rf = role_filter;
+            let sf = session_filter;
             let claude_matches: Vec<SearchMatch> = session_files
                 .par_iter()
                 .flat_map(|path| {
+
                     let mut file_matches = Vec::new();
                     let file = match fs::File::open(path) {
                         Ok(f) => f,
@@ -599,6 +631,19 @@ fn search_transcripts(
                             _ => continue,
                         };
 
+                        let role = if entry_type == "user" {
+                            "you"
+                        } else {
+                            "claude"
+                        };
+
+                        // Role filter
+                        if let Some(rfilt) = rf {
+                            if !matches_role(role, rfilt) {
+                                continue;
+                            }
+                        }
+
                         let ts_str = match &entry.timestamp {
                             Some(s) => s.clone(),
                             None => continue,
@@ -614,6 +659,24 @@ fn search_transcripts(
                         let ts_ms = ts_dt.timestamp() * 1000;
                         if ts_ms < start_ms || ts_ms >= end_ms {
                             continue;
+                        }
+
+                        // Session filter: check entry sessionId, fall back to file stem
+                        if let Some(sfilt) = sf {
+                            let sid = entry.session_id.as_deref().unwrap_or_else(|| {
+                                // No sessionId in entry — use filename as session
+                                ""
+                            });
+                            let effective_sid = if sid.is_empty() {
+                                path.file_stem()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                            } else {
+                                std::borrow::Cow::Borrowed(sid)
+                            };
+                            if !effective_sid.starts_with(sfilt) {
+                                continue;
+                            }
                         }
 
                         let content = match &entry.message {
@@ -637,11 +700,6 @@ fn search_transcripts(
                                     .to_string_lossy()
                                     .to_string()
                             });
-                            let role = if entry_type == "user" {
-                                "you"
-                            } else {
-                                "claude"
-                            };
                             let snippet = make_snippet(&text, m.start(), m.end());
 
                             file_matches.push(SearchMatch {
@@ -736,6 +794,13 @@ fn search_transcripts(
                         Err(_) => continue,
                     };
 
+                    // Session filter for OpenCode
+                    if let Some(sfilt) = session_filter {
+                        if !sess_id.starts_with(sfilt) && !sess_id[..sess_id.len().min(8)].starts_with(sfilt) {
+                            continue;
+                        }
+                    }
+
                     for mf in msg_files {
                         let mc = match fs::read_to_string(mf.path()) {
                             Ok(c) => c,
@@ -749,6 +814,19 @@ fn search_transcripts(
                         let role_str = msg.role.as_deref().unwrap_or("");
                         if role_str != "user" && role_str != "assistant" {
                             continue;
+                        }
+
+                        let role = if role_str == "user" {
+                            "you"
+                        } else {
+                            "opencode"
+                        };
+
+                        // Role filter
+                        if let Some(rfilt) = role_filter {
+                            if !matches_role(role, rfilt) {
+                                continue;
+                            }
                         }
 
                         let ts_ms = msg.time.as_ref().and_then(|t| t.created).unwrap_or(0);
@@ -784,11 +862,6 @@ fn search_transcripts(
                         if !text.is_empty() {
                             if let Some(m) = regex.find(&text) {
                                 let dt = ms_to_hkt(ts_ms);
-                                let role = if role_str == "user" {
-                                    "you"
-                                } else {
-                                    "opencode"
-                                };
                                 let snippet = make_snippet(&text, m.start(), m.end());
 
                                 matches.push(SearchMatch {
@@ -813,6 +886,20 @@ fn search_transcripts(
 }
 
 // --- Helpers ---
+
+/// Check if a role matches the filter. Supports aliases:
+/// "you" / "user" / "me" → matches "you"
+/// "claude" / "assistant" / "ai" → matches "claude" or "opencode"
+/// "opencode" → matches "opencode" only
+fn matches_role(role: &str, filter: &str) -> bool {
+    let f = filter.to_lowercase();
+    match f.as_str() {
+        "you" | "user" | "me" => role == "you",
+        "claude" | "assistant" | "ai" => role == "claude" || role == "opencode",
+        "opencode" => role == "opencode",
+        _ => role.eq_ignore_ascii_case(&f),
+    }
+}
 
 fn make_snippet(text: &str, match_start: usize, match_end: usize) -> String {
     // Find char-safe boundaries
@@ -927,13 +1014,20 @@ fn print_scan(prompts: &[Prompt], date_str: &str, full: bool) {
     }
 }
 
-fn print_search(matches: &[SearchMatch], pattern: &str, days: u32, deep: bool) {
+fn print_search(matches: &[SearchMatch], pattern: &str, days: u32, deep: bool, role_filter: Option<&str>, session_filter: Option<&str>) {
     let mode = if deep {
         "full transcripts"
     } else {
         "prompts only"
     };
-    println!("Search: \"{}\" (last {} days, {})", pattern, days, mode);
+    let mut filters = String::new();
+    if let Some(r) = role_filter {
+        filters.push_str(&format!(", role={}", r));
+    }
+    if let Some(s) = session_filter {
+        filters.push_str(&format!(", session={}", s));
+    }
+    println!("Search: \"{}\" (last {} days, {}{})", pattern, days, mode, filters);
 
     if matches.is_empty() {
         println!("No matches found.");
@@ -1026,6 +1120,8 @@ fn main() {
             days,
             deep,
             tool,
+            role,
+            session,
             json,
         }) => {
             let now = Utc::now().with_timezone(&hkt());
@@ -1041,9 +1137,9 @@ fn main() {
             let t0 = Instant::now();
 
             let matches = if deep {
-                search_transcripts(&pattern, start_ms, end_ms, tool.as_deref())
+                search_transcripts(&pattern, start_ms, end_ms, tool.as_deref(), role.as_deref(), session.as_deref())
             } else {
-                search_prompts(&pattern, start_ms, end_ms, tool.as_deref())
+                search_prompts(&pattern, start_ms, end_ms, tool.as_deref(), role.as_deref(), session.as_deref())
             };
 
             let elapsed = t0.elapsed();
@@ -1051,7 +1147,7 @@ fn main() {
             if json {
                 print_json_search(&matches);
             } else {
-                print_search(&matches, &pattern, days, deep);
+                print_search(&matches, &pattern, days, deep, role.as_deref(), session.as_deref());
                 println!("({:.1}s)", elapsed.as_secs_f64());
             }
         }
