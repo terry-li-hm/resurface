@@ -28,3 +28,13 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+assert_cmd = "2.1.2"
+predicates = "3.1.4"
+
+[lints.clippy]
+# Pre-existing issues in src/main.rs — suppressed at project level rather than
+# modifying source files (test-only change policy).
+redundant_closure = "allow"
+unnecessary_lazy_evaluations = "allow"

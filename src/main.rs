@@ -97,7 +97,7 @@ struct SessionInfo {
 // --- CLI ---
 
 #[derive(Parser)]
-#[command(name = "resurface", about = "Search AI coding chat history")]
+#[command(name = "resurface", about = "Search AI coding chat history", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
