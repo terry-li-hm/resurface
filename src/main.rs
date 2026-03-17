@@ -130,9 +130,9 @@ enum Commands {
         #[arg(long, default_value = "7")]
         days: u32,
 
-        /// Search full transcripts (user + assistant), not just prompts
+        /// Search user prompts only (default: search full transcripts)
         #[arg(long)]
-        deep: bool,
+        prompts_only: bool,
 
         /// Filter by tool
         #[arg(long)]
@@ -1118,12 +1118,13 @@ fn main() {
         Some(Commands::Search {
             pattern,
             days,
-            deep,
+            prompts_only,
             tool,
             role,
             session,
             json,
         }) => {
+            let deep = !prompts_only;
             let now = Utc::now().with_timezone(&hkt());
             let end = (now + Duration::days(1))
                 .date_naive()
