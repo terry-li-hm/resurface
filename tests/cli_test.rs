@@ -17,7 +17,7 @@ fn test_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("resurface"));
+        .stdout(predicate::str::contains("anam"));
 }
 
 // --help exits 0 and shows the about text and a Usage line.
@@ -46,7 +46,7 @@ fn test_search_help() {
         .success()
         .stdout(predicate::str::contains("pattern"))
         .stdout(predicate::str::contains("--days"))
-        .stdout(predicate::str::contains("--deep"))
+        .stdout(predicate::str::contains("--prompts-only"))
         .stdout(predicate::str::contains("--role"))
         .stdout(predicate::str::contains("--session"));
 }
