@@ -6,7 +6,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const HKT_OFFSET: i32 = 8 * 3600;
@@ -138,7 +138,7 @@ enum Commands {
         #[arg(long)]
         tool: Option<String>,
 
-        /// Filter by role (you, claude, opencode, assistant)
+        /// Filter by role (you, claude, opencode, codex, assistant)
         #[arg(long)]
         role: Option<String>,
 
@@ -160,9 +160,15 @@ fn home_dir() -> PathBuf {
 
 fn history_files() -> Vec<(String, PathBuf)> {
     let home = home_dir();
+    // Codex moved from ~/.codex/history.jsonl to rollout transcripts (see scan_codex).
+    vec![("Claude".into(), home.join(".claude/history.jsonl"))]
+}
+
+fn codex_session_roots() -> Vec<PathBuf> {
+    let home = home_dir();
     vec![
-        ("Claude".into(), home.join(".claude/history.jsonl")),
-        ("Codex".into(), home.join(".codex/history.jsonl")),
+        home.join(".codex/sessions"),
+        home.join(".codex/archived_sessions"),
     ]
 }
 
@@ -296,6 +302,15 @@ fn scan_history(date_str: &str, tool_filter: Option<&str>) -> Vec<Prompt> {
             .unwrap_or(false)
     {
         prompts.extend(scan_opencode(start_ms, end_ms));
+    }
+
+    // Codex (rollout transcripts)
+    if tool_filter.is_none()
+        || tool_filter
+            .map(|t| t.eq_ignore_ascii_case("codex"))
+            .unwrap_or(false)
+    {
+        prompts.extend(scan_codex(start_ms, end_ms));
     }
 
     prompts.sort_by_key(|p| p.timestamp_ms);
@@ -437,6 +452,173 @@ fn scan_opencode(start_ms: i64, end_ms: i64) -> Vec<Prompt> {
     prompts
 }
 
+// --- Codex scanning (rollout transcripts) ---
+
+struct CodexMessage {
+    timestamp_ms: i64,
+    role: String,
+    text: String,
+}
+
+fn collect_codex_rollouts(dir: &Path, start_epoch: i64, end_epoch: i64, out: &mut Vec<PathBuf>) {
+    let rd = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in rd.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let meta = match path.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            collect_codex_rollouts(&path, start_epoch, end_epoch, out);
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        if let Ok(mtime) = meta.modified() {
+            let epoch = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if epoch >= start_epoch && epoch <= end_epoch {
+                out.push(path);
+            }
+        }
+    }
+}
+
+fn codex_rollout_files(start_ms: i64, end_ms: i64) -> Vec<PathBuf> {
+    let start_epoch = (start_ms / 1000) - 86400;
+    let end_epoch = (end_ms / 1000) + 86400;
+    let mut files = Vec::new();
+    for root in codex_session_roots() {
+        if root.exists() {
+            collect_codex_rollouts(&root, start_epoch, end_epoch, &mut files);
+        }
+    }
+    files
+}
+
+fn codex_session_id(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    if stem.len() > 36 {
+        let mut start = stem.len() - 36;
+        while start < stem.len() && !stem.is_char_boundary(start) {
+            start += 1;
+        }
+        stem[start..].to_string()
+    } else {
+        stem
+    }
+}
+
+fn codex_messages(path: &Path) -> Vec<CodexMessage> {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file);
+    let mut messages = Vec::new();
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let val: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if val.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+            continue;
+        }
+        let payload = match val.get("payload") {
+            Some(p) => p,
+            None => continue,
+        };
+        if payload.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+        let role = match payload.get("role").and_then(|r| r.as_str()) {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            _ => continue,
+        };
+        let ts_str = match val.get("timestamp").and_then(|t| t.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let ts_dt = match DateTime::parse_from_rfc3339(&ts_str.replace('Z', "+00:00")) {
+            Ok(dt) => dt,
+            Err(_) => continue,
+        };
+        let timestamp_ms = ts_dt.timestamp() * 1000;
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(content) = payload.get("content").and_then(|c| c.as_array()) {
+            for block in content {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    if !text.is_empty() {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+        }
+        let text = parts.join(" ");
+        if text.is_empty() {
+            continue;
+        }
+        messages.push(CodexMessage {
+            timestamp_ms,
+            role: role.to_string(),
+            text,
+        });
+    }
+    messages
+}
+
+fn scan_codex(start_ms: i64, end_ms: i64) -> Vec<Prompt> {
+    let files = codex_rollout_files(start_ms, end_ms);
+    files
+        .par_iter()
+        .flat_map(|path| {
+            let session_full = codex_session_id(path);
+            let session = session_full[..session_full.len().min(8)].to_string();
+            let mut out = Vec::new();
+            for msg in codex_messages(path) {
+                if msg.role != "user" {
+                    continue;
+                }
+                if msg.timestamp_ms < start_ms || msg.timestamp_ms >= end_ms {
+                    continue;
+                }
+                let dt = ms_to_hkt(msg.timestamp_ms);
+                out.push(Prompt {
+                    time_str: dt.format("%H:%M").to_string(),
+                    timestamp_ms: msg.timestamp_ms,
+                    session: session.clone(),
+                    session_full: session_full.clone(),
+                    prompt: msg.text,
+                    tool: "Codex".into(),
+                });
+            }
+            out
+        })
+        .collect()
+}
+
 // --- Search prompts (fast) ---
 
 fn search_prompts(
@@ -537,6 +719,34 @@ fn search_prompts(
                     role: "you".into(),
                     snippet,
                     tool: "OpenCode".into(),
+                });
+            }
+        }
+    }
+
+    // Codex (rollout transcripts)
+    if tool_filter.is_none()
+        || tool_filter
+            .map(|t| t.eq_ignore_ascii_case("codex"))
+            .unwrap_or(false)
+    {
+        let codex_prompts = scan_codex(start_ms, end_ms);
+        for p in &codex_prompts {
+            if let Some(sf) = session_filter {
+                if !p.session_full.starts_with(sf) && !p.session.starts_with(sf) {
+                    continue;
+                }
+            }
+            if let Some(m) = regex.find(&p.prompt) {
+                let snippet = make_snippet(&p.prompt, m.start(), m.end());
+                matches.push(SearchMatch {
+                    date: ms_to_hkt(p.timestamp_ms).format("%Y-%m-%d").to_string(),
+                    time_str: p.time_str.clone(),
+                    timestamp_ms: p.timestamp_ms,
+                    session: p.session.clone(),
+                    role: "you".into(),
+                    snippet,
+                    tool: "Codex".into(),
                 });
             }
         }
@@ -881,6 +1091,61 @@ fn search_transcripts(
         }
     }
 
+    // Codex transcripts (rollout files)
+    if tool_filter.is_none()
+        || tool_filter
+            .map(|t| t.eq_ignore_ascii_case("codex"))
+            .unwrap_or(false)
+    {
+        let codex_files = codex_rollout_files(start_ms, end_ms);
+        let rf = role_filter;
+        let sf = session_filter;
+        let codex_matches: Vec<SearchMatch> = codex_files
+            .par_iter()
+            .flat_map(|path| {
+                let mut file_matches = Vec::new();
+                let session_full = codex_session_id(path);
+                let session_short = session_full[..session_full.len().min(8)].to_string();
+                if let Some(sfilt) = sf {
+                    if !session_full.starts_with(sfilt) && !session_short.starts_with(sfilt) {
+                        return file_matches;
+                    }
+                }
+                for msg in codex_messages(path) {
+                    let role = match msg.role.as_str() {
+                        "user" => "you",
+                        "assistant" => "codex",
+                        _ => continue,
+                    };
+                    if let Some(rfilt) = rf {
+                        if !matches_role(role, rfilt) {
+                            continue;
+                        }
+                    }
+                    let ts_ms = msg.timestamp_ms;
+                    if ts_ms < start_ms || ts_ms >= end_ms {
+                        continue;
+                    }
+                    if let Some(m) = regex.find(&msg.text) {
+                        let dt = ms_to_hkt(ts_ms);
+                        let snippet = make_snippet(&msg.text, m.start(), m.end());
+                        file_matches.push(SearchMatch {
+                            date: dt.format("%Y-%m-%d").to_string(),
+                            time_str: dt.format("%H:%M").to_string(),
+                            timestamp_ms: ts_ms,
+                            session: session_short.clone(),
+                            role: role.into(),
+                            snippet,
+                            tool: "Codex".into(),
+                        });
+                    }
+                }
+                file_matches
+            })
+            .collect();
+        matches.extend(codex_matches);
+    }
+
     matches.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
     matches
 }
@@ -889,14 +1154,16 @@ fn search_transcripts(
 
 /// Check if a role matches the filter. Supports aliases:
 /// "you" / "user" / "me" → matches "you"
-/// "claude" / "assistant" / "ai" → matches "claude" or "opencode"
+/// "claude" / "assistant" / "ai" → matches "claude", "opencode", or "codex"
 /// "opencode" → matches "opencode" only
+/// "codex" → matches "codex" only
 fn matches_role(role: &str, filter: &str) -> bool {
     let f = filter.to_lowercase();
     match f.as_str() {
         "you" | "user" | "me" => role == "you",
-        "claude" | "assistant" | "ai" => role == "claude" || role == "opencode",
+        "claude" | "assistant" | "ai" => role == "claude" || role == "opencode" || role == "codex",
         "opencode" => role == "opencode",
+        "codex" => role == "codex",
         _ => role.eq_ignore_ascii_case(&f),
     }
 }
