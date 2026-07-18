@@ -100,6 +100,47 @@ fn test_search_invalid_regex() {
         .stderr(predicate::str::contains("Invalid regex"));
 }
 
+// `search` with `--full` flag: flag is accepted; exits 0 (no data → no matches).
+#[test]
+fn test_search_full_flag_accepted() {
+    anam!()
+        .args(["search", "anything", "--full", "--days", "1"])
+        .assert()
+        .success();
+}
+
+// `dump --help` exits 0 and documents the key flags.
+#[test]
+fn test_dump_help() {
+    anam!()
+        .args(["dump", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("session"))
+        .stdout(predicate::str::contains("--include-tools"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+// `dump` with no positional session prefix: exits non-zero with a clap error.
+#[test]
+fn test_dump_missing_session() {
+    anam!()
+        .arg("dump")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("session").or(predicate::str::contains("required")));
+}
+
+// `dump` with a prefix that matches nothing: exits non-zero with a clear message.
+#[test]
+fn test_dump_no_match() {
+    anam!()
+        .args(["dump", "zzzzzzzz-no-such-session"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No session found"));
+}
+
 // `search` with `--json` produces a JSON array when history data is present.
 // Ignored because it requires real JSONL history files on disk.
 #[test]
