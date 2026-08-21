@@ -1858,3 +1858,395 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::env;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempJsonl(PathBuf);
+
+    impl Drop for TempJsonl {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn temp_jsonl(body: &str) -> TempJsonl {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "anam-unit-{}-{:?}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().id(),
+            nanos
+        ));
+        fs::write(&path, body).unwrap();
+        TempJsonl(path)
+    }
+
+    // --- date_to_range_ms ---
+
+    #[test]
+    fn date_to_range_ms_hkt_midnight_exclusive_end() {
+        let (start, end) = date_to_range_ms("2026-02-21");
+        assert_eq!(start, 1_771_603_200_000);
+        assert_eq!(end, 1_771_689_600_000);
+        assert_eq!(end - start, 86_400_000);
+        assert_eq!(
+            ms_to_hkt(start).format("%Y-%m-%d %H:%M:%S %:z").to_string(),
+            "2026-02-21 00:00:00 +08:00"
+        );
+        assert_eq!(
+            ms_to_hkt(end).format("%Y-%m-%d %H:%M:%S %:z").to_string(),
+            "2026-02-22 00:00:00 +08:00"
+        );
+    }
+
+    #[test]
+    fn date_to_range_ms_leap_day() {
+        let (start, end) = date_to_range_ms("2024-02-29");
+        assert_eq!(start, 1_709_136_000_000);
+        assert_eq!(end - start, 86_400_000);
+        assert_eq!(
+            ms_to_hkt(start).format("%Y-%m-%d").to_string(),
+            "2024-02-29"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid date")]
+    fn date_to_range_ms_rejects_non_iso() {
+        let _ = date_to_range_ms("today");
+    }
+
+    // --- resolve_date ---
+
+    #[test]
+    fn resolve_date_literal_passthrough() {
+        assert_eq!(resolve_date("2026-02-21"), "2026-02-21");
+    }
+
+    #[test]
+    fn resolve_date_today_and_yesterday_are_hkt_calendar_days() {
+        let today = resolve_date("today");
+        let yesterday = resolve_date("yesterday");
+        let today_d = NaiveDate::parse_from_str(&today, "%Y-%m-%d").unwrap();
+        let yesterday_d = NaiveDate::parse_from_str(&yesterday, "%Y-%m-%d").unwrap();
+        assert_eq!(today_d - yesterday_d, Duration::days(1));
+        let now_hkt = Utc::now().with_timezone(&hkt()).date_naive();
+        assert_eq!(today_d, now_hkt);
+    }
+
+    // --- ms_to_hkt ---
+
+    #[test]
+    fn ms_to_hkt_known_instant_and_millis() {
+        let dt = ms_to_hkt(1_771_603_200_000);
+        assert_eq!(dt.offset().local_minus_utc(), HKT_OFFSET);
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-02-21 00:00:00"
+        );
+        let dt = ms_to_hkt(1_771_603_200_500);
+        assert_eq!(dt.timestamp_subsec_millis(), 500);
+    }
+
+    #[test]
+    fn ms_to_hkt_unix_epoch_is_eight_am_hkt() {
+        let dt = ms_to_hkt(0);
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S %:z").to_string(),
+            "1970-01-01 08:00:00 +08:00"
+        );
+    }
+
+    #[test]
+    fn ms_to_hkt_negative_falls_back_to_now() {
+        // BUG: `ms % 1000` is negative, the nsec cast overflows u32 /
+        // fails `from_timestamp`, and the function returns Utc::now().
+        // Repro: ms_to_hkt(-1500) is ~now, not 1969-12-31 23:59:58.500 UTC.
+        let got = ms_to_hkt(-1500);
+        let now_year = Utc::now().with_timezone(&hkt()).format("%Y").to_string();
+        assert_eq!(got.format("%Y").to_string(), now_year);
+        assert_ne!(got.format("%Y").to_string(), "1969");
+    }
+
+    #[test]
+    fn ms_to_hkt_out_of_range_falls_back_to_now() {
+        // Same fallback: from_timestamp(None) → Utc::now().
+        let got = ms_to_hkt(i64::MAX);
+        let now_year = Utc::now().with_timezone(&hkt()).format("%Y").to_string();
+        assert_eq!(got.format("%Y").to_string(), now_year);
+    }
+
+    // --- matches_role ---
+
+    #[test]
+    fn matches_role_aliases() {
+        assert!(matches_role("you", "you"));
+        assert!(matches_role("you", "user"));
+        assert!(matches_role("you", "me"));
+        assert!(matches_role("you", "YOU"));
+        assert!(!matches_role("claude", "you"));
+
+        assert!(matches_role("claude", "claude"));
+        assert!(matches_role("claude", "assistant"));
+        assert!(matches_role("claude", "ai"));
+        // Current behavior: claude/assistant/ai match every assistant-family role.
+        assert!(matches_role("opencode", "claude"));
+        assert!(matches_role("codex", "assistant"));
+
+        assert!(matches_role("opencode", "opencode"));
+        assert!(!matches_role("claude", "opencode"));
+        assert!(!matches_role("codex", "opencode"));
+
+        assert!(matches_role("codex", "codex"));
+        assert!(!matches_role("claude", "codex"));
+
+        assert!(matches_role("tool", "TOOL"));
+        assert!(!matches_role("you", "human"));
+
+        // Role argument is case-sensitive except in the unknown-filter fallback.
+        assert!(!matches_role("You", "you"));
+    }
+
+    // --- make_snippet ---
+
+    #[test]
+    fn make_snippet_short_string_is_unchanged() {
+        assert_eq!(make_snippet("short", 0, 5), "short");
+        assert_eq!(make_snippet("", 0, 0), "");
+    }
+
+    #[test]
+    fn make_snippet_adds_ellipses_and_flattens_newlines() {
+        let text = "x".repeat(200);
+        let snippet = make_snippet(&text, 100, 105);
+        assert!(snippet.starts_with("..."));
+        assert!(snippet.ends_with("..."));
+
+        let text = "line1\nline2 MATCH line3";
+        let start = text.find("MATCH").unwrap();
+        let snippet = make_snippet(text, start, start + 5);
+        assert!(snippet.contains("line1 line2 MATCH line3"));
+        assert!(!snippet.contains('\n'));
+    }
+
+    #[test]
+    fn make_snippet_walks_off_cjk_char_boundaries() {
+        let prefix = "字".repeat(14);
+        let suffix = "字".repeat(30);
+        let text = format!("{prefix}TARGET{suffix}");
+        let start = text.find("TARGET").unwrap();
+        assert!(!text.is_char_boundary(start.saturating_sub(40)));
+        let snippet = make_snippet(&text, start, start + 6);
+        assert!(snippet.contains("TARGET"));
+    }
+
+    // --- extract_text ---
+
+    #[test]
+    fn extract_text_string_blocks_and_skips() {
+        assert_eq!(extract_text(&json!("hello")), "hello");
+        assert_eq!(
+            extract_text(&json!([
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"}
+            ])),
+            "a b"
+        );
+        assert_eq!(
+            extract_text(&json!([{"type": "tool_use", "name": "Edit"}])),
+            "[tool: Edit]"
+        );
+        assert_eq!(
+            extract_text(&json!([
+                {"type": "text", "text": "hi"},
+                {"type": "tool_use", "name": "Read"},
+                {"type": "tool_result", "content": "ignored"}
+            ])),
+            "hi [tool: Read]"
+        );
+        assert_eq!(extract_text(&json!(null)), "");
+        assert_eq!(extract_text(&json!({"type": "text", "text": "nope"})), "");
+        assert_eq!(extract_text(&json!(["bare string"])), "");
+        assert_eq!(
+            extract_text(&json!([{"type": "thinking", "thinking": "secret"}])),
+            ""
+        );
+    }
+
+    // --- extract_dump_text ---
+
+    #[test]
+    fn extract_dump_text_omits_or_renders_tools() {
+        let mixed = json!([
+            {"type": "text", "text": "hello"},
+            {"type": "tool_use", "name": "Edit", "input": {"path": "a.rs"}},
+            {"type": "tool_result", "content": "ok"}
+        ]);
+        assert_eq!(extract_dump_text(&mixed, false), "hello");
+        let with_tools = extract_dump_text(&mixed, true);
+        assert!(with_tools.contains("hello"));
+        assert!(with_tools.contains("[tool_use: Edit]"));
+        assert!(
+            with_tools.contains("\"path\":\"a.rs\"") || with_tools.contains("\"path\": \"a.rs\"")
+        );
+        assert!(with_tools.contains("[tool_result] ok"));
+        assert!(with_tools.contains('\n'));
+        assert_eq!(extract_dump_text(&json!("plain"), false), "plain");
+        assert_eq!(extract_dump_text(&json!(42), true), "");
+    }
+
+    #[test]
+    fn extract_dump_text_recurses_into_tool_result_blocks() {
+        let nested = json!([
+            {"type": "tool_result", "content": [{"type": "text", "text": "inner"}]}
+        ]);
+        assert_eq!(extract_dump_text(&nested, true), "[tool_result] inner");
+        assert_eq!(extract_dump_text(&nested, false), "");
+    }
+
+    // --- codex_session_id ---
+
+    #[test]
+    fn codex_session_id_takes_trailing_uuid() {
+        let uuid = "12345678-1234-1234-1234-123456789abc";
+        let path = PathBuf::from(format!("/tmp/rollout-2026-02-21T08-00-00-{uuid}.jsonl"));
+        assert_eq!(codex_session_id(&path), uuid);
+        assert_eq!(
+            codex_session_id(Path::new("rollout-short.jsonl")),
+            "rollout-short"
+        );
+        assert_eq!(codex_session_id(Path::new("")), "");
+    }
+
+    #[test]
+    fn codex_session_id_walks_char_boundary_on_cut() {
+        let stem = format!("é{}", "a".repeat(35));
+        assert!(stem.len() > 36);
+        let cut = stem.len() - 36;
+        assert!(!stem.is_char_boundary(cut));
+        let id = codex_session_id(&PathBuf::from(format!("{stem}.jsonl")));
+        assert!(!id.is_empty());
+        assert!(id.is_char_boundary(id.len()));
+    }
+
+    // --- synthetic JSONL fixtures per session format ---
+
+    #[test]
+    fn claude_history_jsonl_fixture() {
+        let line = r#"{"timestamp":1771603200000,"sessionId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","display":"shown","prompt":"raw"}"#;
+        let entry: HistoryEntry = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            entry.session_id.as_deref(),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+        let ts = match &entry.timestamp {
+            Some(serde_json::Value::Number(n)) => n.as_i64().unwrap(),
+            other => panic!("expected numeric timestamp, got {other:?}"),
+        };
+        assert_eq!(ts, 1_771_603_200_000);
+        assert_eq!(
+            entry.display.clone().or(entry.prompt.clone()).as_deref(),
+            Some("shown")
+        );
+
+        let prompt_only: HistoryEntry = serde_json::from_str(
+            r#"{"timestamp":1771603200000,"sessionId":"s","prompt":"only prompt"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            prompt_only.display.or(prompt_only.prompt).as_deref(),
+            Some("only prompt")
+        );
+
+        // String timestamps deserialize but scan_history only accepts Number.
+        let iso: HistoryEntry = serde_json::from_str(
+            r#"{"timestamp":"2026-02-21T00:00:00Z","sessionId":"s","prompt":"iso"}"#,
+        )
+        .unwrap();
+        assert!(!matches!(iso.timestamp, Some(serde_json::Value::Number(_))));
+    }
+
+    #[test]
+    fn claude_transcript_jsonl_fixture() {
+        let user: TranscriptEntry = serde_json::from_str(
+            r#"{"type":"user","timestamp":"2026-02-21T00:00:00.000Z","sessionId":"sess-1","message":{"content":"plain user"}}"#,
+        )
+        .unwrap();
+        assert_eq!(user.entry_type.as_deref(), Some("user"));
+        let text = extract_text(user.message.as_ref().unwrap().content.as_ref().unwrap());
+        assert_eq!(text, "plain user");
+
+        let assistant: TranscriptEntry = serde_json::from_str(
+            r#"{"type":"assistant","timestamp":"2026-02-21T00:00:01.000Z","sessionId":"sess-1","message":{"content":[{"type":"text","text":"reply"},{"type":"tool_use","name":"Bash"}]}}"#,
+        )
+        .unwrap();
+        let content = assistant.message.unwrap().content.unwrap();
+        assert_eq!(extract_text(&content), "reply [tool: Bash]");
+        assert_eq!(extract_dump_text(&content, false), "reply");
+    }
+
+    #[test]
+    fn codex_rollout_jsonl_fixture() {
+        let body = concat!(
+            r#"{"type":"session_meta","timestamp":"2026-02-21T04:00:00.000Z"}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-02-21T04:00:00.500Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"auth middleware"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-02-21T04:00:01Z","payload":{"type":"message","role":"assistant","content":[{"text":"here is a patch"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-02-21T04:00:02Z","payload":{"type":"function_call","name":"exec"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-02-21T04:00:03Z","payload":{"type":"message","role":"system","content":[{"text":"skip me"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-02-21T04:00:04Z","payload":{"type":"message","role":"user","content":[{"text":""}]}}"#,
+            "\n",
+            "not json\n",
+        );
+        let tmp = temp_jsonl(body);
+        let msgs = codex_messages(&tmp.0);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].text, "auth middleware");
+        let expected_ms = DateTime::parse_from_rfc3339("2026-02-21T04:00:00+00:00")
+            .unwrap()
+            .timestamp()
+            * 1000;
+        // `.timestamp() * 1000` drops the 500ms fraction on the source stamp.
+        assert_eq!(msgs[0].timestamp_ms, expected_ms);
+        assert_eq!(msgs[0].timestamp_ms % 1000, 0);
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].text, "here is a patch");
+    }
+
+    #[test]
+    fn opencode_json_fixtures() {
+        let sess: OpenCodeSession = serde_json::from_str(
+            r#"{"id":"ses_abc123","time":{"created":1771603200000,"updated":1771603300000},"extra":true}"#,
+        )
+        .unwrap();
+        assert_eq!(sess.id.as_deref(), Some("ses_abc123"));
+        assert_eq!(sess.time.as_ref().unwrap().created, Some(1_771_603_200_000));
+        assert_eq!(sess.time.as_ref().unwrap().updated, Some(1_771_603_300_000));
+
+        let msg: OpenCodeMessage = serde_json::from_str(
+            r#"{"id":"msg_1","role":"user","time":{"created":1771603200000}}"#,
+        )
+        .unwrap();
+        assert_eq!(msg.role.as_deref(), Some("user"));
+        assert_eq!(msg.id.as_deref(), Some("msg_1"));
+
+        let part: OpenCodePart =
+            serde_json::from_str(r#"{"type":"text","text":"hello from opencode"}"#).unwrap();
+        assert_eq!(part.text.as_deref(), Some("hello from opencode"));
+    }
+}
