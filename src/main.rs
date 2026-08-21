@@ -138,7 +138,9 @@ enum Commands {
         #[arg(long)]
         tool: Option<String>,
 
-        /// Filter by role (you, claude, opencode, codex, assistant)
+        /// Filter by role. Each name is tool-specific: you (aliases: user, me),
+        /// claude (aliases: assistant, ai), opencode, codex. assistant/ai match
+        /// Claude turns only, not OpenCode or Codex.
         #[arg(long)]
         role: Option<String>,
 
@@ -230,9 +232,15 @@ fn resolve_date(input: &str) -> String {
     }
 }
 
+/// Convert epoch milliseconds to HKT.
+///
+/// Valid timestamps (including pre-epoch negatives) convert directly.
+/// Values chrono cannot represent are clamped to the Unix epoch
+/// (1970-01-01 08:00:00 HKT) rather than `Utc::now()`, so a corrupt
+/// record cannot date itself today.
 fn ms_to_hkt(ms: i64) -> DateTime<FixedOffset> {
-    DateTime::from_timestamp(ms / 1000, ((ms % 1000) * 1_000_000) as u32)
-        .unwrap_or_else(|| Utc::now())
+    DateTime::from_timestamp_millis(ms)
+        .unwrap_or(DateTime::UNIX_EPOCH)
         .with_timezone(&hkt())
 }
 
@@ -1189,19 +1197,22 @@ fn search_transcripts(
 
 // --- Helpers ---
 
-/// Check if a role matches the filter. Supports aliases:
-/// "you" / "user" / "me" → matches "you"
-/// "claude" / "assistant" / "ai" → matches "claude", "opencode", or "codex"
-/// "opencode" → matches "opencode" only
-/// "codex" → matches "codex" only
+/// Check if a stored role matches the `--role` filter.
+/// Matching is case-insensitive. Each filter is tool-specific:
+/// "you" / "user" / "me" → "you"
+/// "claude" / "assistant" / "ai" → "claude" only (not OpenCode or Codex)
+/// "opencode" → "opencode" only
+/// "codex" → "codex" only
+/// Unknown filters match the stored role by case-insensitive name.
 fn matches_role(role: &str, filter: &str) -> bool {
-    let f = filter.to_lowercase();
+    let r = role.to_ascii_lowercase();
+    let f = filter.to_ascii_lowercase();
     match f.as_str() {
-        "you" | "user" | "me" => role == "you",
-        "claude" | "assistant" | "ai" => role == "claude" || role == "opencode" || role == "codex",
-        "opencode" => role == "opencode",
-        "codex" => role == "codex",
-        _ => role.eq_ignore_ascii_case(&f),
+        "you" | "user" | "me" => r == "you",
+        "claude" | "assistant" | "ai" => r == "claude",
+        "opencode" => r == "opencode",
+        "codex" => r == "codex",
+        _ => r == f,
     }
 }
 
@@ -1968,22 +1979,27 @@ mod tests {
     }
 
     #[test]
-    fn ms_to_hkt_negative_falls_back_to_now() {
-        // BUG: `ms % 1000` is negative, the nsec cast overflows u32 /
-        // fails `from_timestamp`, and the function returns Utc::now().
-        // Repro: ms_to_hkt(-1500) is ~now, not 1969-12-31 23:59:58.500 UTC.
+    fn ms_to_hkt_negative_millis_convert_not_now() {
+        // -1500 ms is 1969-12-31 23:59:58.500 UTC = 1970-01-01 07:59:58.500 HKT.
         let got = ms_to_hkt(-1500);
+        assert_eq!(
+            got.format("%Y-%m-%d %H:%M:%S%.3f %:z").to_string(),
+            "1970-01-01 07:59:58.500 +08:00"
+        );
         let now_year = Utc::now().with_timezone(&hkt()).format("%Y").to_string();
-        assert_eq!(got.format("%Y").to_string(), now_year);
-        assert_ne!(got.format("%Y").to_string(), "1969");
+        assert_ne!(got.format("%Y").to_string(), now_year);
     }
 
     #[test]
-    fn ms_to_hkt_out_of_range_falls_back_to_now() {
-        // Same fallback: from_timestamp(None) → Utc::now().
+    fn ms_to_hkt_out_of_range_clamps_to_unix_epoch() {
+        // Unrepresentable millis clamp to Unix epoch, not Utc::now().
         let got = ms_to_hkt(i64::MAX);
+        assert_eq!(
+            got.format("%Y-%m-%d %H:%M:%S %:z").to_string(),
+            "1970-01-01 08:00:00 +08:00"
+        );
         let now_year = Utc::now().with_timezone(&hkt()).format("%Y").to_string();
-        assert_eq!(got.format("%Y").to_string(), now_year);
+        assert_ne!(got.format("%Y").to_string(), now_year);
     }
 
     // --- matches_role ---
@@ -1999,9 +2015,11 @@ mod tests {
         assert!(matches_role("claude", "claude"));
         assert!(matches_role("claude", "assistant"));
         assert!(matches_role("claude", "ai"));
-        // Current behavior: claude/assistant/ai match every assistant-family role.
-        assert!(matches_role("opencode", "claude"));
-        assert!(matches_role("codex", "assistant"));
+        // claude/assistant/ai are Claude-specific, not a family matcher.
+        assert!(!matches_role("opencode", "claude"));
+        assert!(!matches_role("codex", "assistant"));
+        assert!(!matches_role("opencode", "ai"));
+        assert!(!matches_role("codex", "claude"));
 
         assert!(matches_role("opencode", "opencode"));
         assert!(!matches_role("claude", "opencode"));
@@ -2013,8 +2031,10 @@ mod tests {
         assert!(matches_role("tool", "TOOL"));
         assert!(!matches_role("you", "human"));
 
-        // Role argument is case-sensitive except in the unknown-filter fallback.
-        assert!(!matches_role("You", "you"));
+        // Filter and stored role are both case-insensitive.
+        assert!(matches_role("You", "you"));
+        assert!(matches_role("CLAUDE", "Assistant"));
+        assert!(matches_role("OpenCode", "OPENCODE"));
     }
 
     // --- make_snippet ---
