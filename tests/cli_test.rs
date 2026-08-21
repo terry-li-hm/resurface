@@ -48,6 +48,7 @@ fn test_search_help() {
         .stdout(predicate::str::contains("--days"))
         .stdout(predicate::str::contains("--prompts-only"))
         .stdout(predicate::str::contains("--role"))
+        .stdout(predicate::str::contains("Claude turns only"))
         .stdout(predicate::str::contains("--session"));
 }
 
